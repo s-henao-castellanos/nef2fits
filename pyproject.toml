@@ -18,7 +18,7 @@ dependencies = [
 classifiers = [
     "Programming Language :: Python :: 3",
     "Development Status :: 4 - Beta",
-    "License :: OSI Approved :: MIT License",
+    "License :: OSI Approved :: GNU General Public License v2 (GPLv2)",
     "Operating System :: OS Independent",
 ]
 readme = {file = "README.md", content-type = "text/markdown"}
@@ -28,5 +28,5 @@ license = {file = "LICENSE"}
 nef2fits = "nef2fits:main"
 
 [project.urls]
-Homepage = "https://github.com/pypa/sampleproject"
-Issues = "https://github.com/pypa/sampleproject/issues"
+Homepage = "https://github.com/s-henao-castellanos/nef2fits"
+Issues = "https://github.com/s-henao-castellanos/nef2fits/issues"
