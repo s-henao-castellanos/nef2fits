@@ -4,16 +4,17 @@ build-backend = "hatchling.build"
 
 [project]
 name = "nef2fits"
-version = "1.0"
+version = "1.5"
 authors = [
     {name="Santiago Henao", email="s.henao.castellanos@gmail.com"},
 ]
 description = "Conversion from NEF raw files into FITS"
-requires-python = ">=3.8"
+requires-python = ">=3.11"
 dependencies = [
     "astropy>=6.0.0",
     "rawpy",
-    "piexif"
+    "piexif",
+    "watchdog"
 ]
 classifiers = [
     "Programming Language :: Python :: 3",

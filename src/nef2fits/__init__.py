@@ -1,1 +1,1 @@
-from .nef2fits import nef2fits,main
+from .nef2fits import nef2fits, main, watch

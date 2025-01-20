@@ -3,18 +3,22 @@ import os
 import re
 import json
 import argparse
+import errno
 from datetime import datetime
 
 import rawpy
 import piexif
+import watchdog
+from watchdog import events,observers
 
 from astropy.io import fits
 import astropy
 
+
 # constants
 
 default_object_regex = r"(?:.+-)?([^_\s]+)(?:_.+)?"
-__version__ = "1.0"
+__version__ = "1.1"
 
 # helpers to decode exif dictionaries 
 def fraction(tup):
@@ -88,6 +92,8 @@ def Nikon_header_from_exif(exif_dict:dict) -> list[tuple]:
     ]
     return to_add
 
+def timestamp():
+    return f"[{datetime.now()}]"
 
 def versions_comment() -> str:
     versions = {k:"?" for k in ["Python","Astropy","rawpy","libraw","piexif"]}
@@ -140,6 +146,8 @@ def nef2fits(
         If regex fails. the whole filename without extension is saved as OBJECT.
         The default regex assumes the filename is something like "observationcode-objectname_details_about_image.nef"
         Only objectame would be extracted for the keywords.
+
+    Returns the name of the new FITS file.
     """
     # filename considerations
     root,ext = os.path.splitext(path)
@@ -195,30 +203,168 @@ def nef2fits(
     if prefix:
         os.makedirs(os.path.dirname(output_fname),exist_ok=True)
     hdul.writeto(output_fname,overwrite=overwrite)
-    print("converted",path,"to fits format, exported to:",output_fname)
+    return output_fname
+    #print("converted",path,"to fits format, exported to:",output_fname)
 
+
+# hate this way of doing things, but this is the only way to invoke code from the watchdog
+class NEF2FITSEventHandler(watchdog.events.FileSystemEventHandler):
+    """Event handler to use with a watchdog observer. The init keyword arguments are all passed directly to the nef2fits function."""
+    def __init__(self, **kwargs):
+        super().__init__()
+        self.options = kwargs
+        
+    def on_moved(self, event):
+        super().on_moved(event)
+        if not event.is_directory:
+            src = event.src_path
+            root,ext = os.path.splitext(src)
+            if ext == ".nef":
+                dest = event.dest_path
+                root_dest,_ = os.path.splitext(dest)
+                print(timestamp(),end=" ")
+                print(f"File '{os.path.basename(src)}' was moved into '{os.path.basename(dest)}'. Moving the FITS file aswell...")
+                old_fits = root+'.fits'
+                if os.path.exists(old_fits):
+                    os.remove(old_fits)
+                nef2fits(dest,**self.options)
+
+    def on_created(self, event):
+        super().on_created(event)
+        if not event.is_directory:
+            path = event.src_path
+            root,ext = os.path.splitext(path)
+            if ext == ".nef":
+                print(timestamp(),end=" ")
+                print(f"Created NEF file '{os.path.basename(root)}', converting into FITS...")
+                nef2fits(path,**self.options)
+                #print(f"\t\tDEBUG: creating {root+'.fits'}")
+
+        #print(event)
+        
+    def on_deleted(self, event):
+        super().on_deleted(event)
+        if not event.is_directory:
+            src = event.src_path
+            root,ext = os.path.splitext(src)
+            if ext == ".nef":
+                print(timestamp(),end=" ")
+                print(f"File '{os.path.basename(src)}' was deleted, but I'm not deleting any corresponding FITS files.")
+        
+    def on_modified(self, event):
+        super().on_modified(event)
+        #print(event)
+    
+
+
+
+
+def watch(directory:str=".",recursive=False,timeout=0.1,**kwargs):
+    event_handler = NEF2FITSEventHandler(**kwargs)
+    observer = watchdog.observers.Observer(timeout=timeout)
+    observer.schedule(event_handler,directory,recursive=recursive)
+    try:
+        observer.start()
+        print(timestamp())
+        print("nef2fits started watching",directory,recursive*"(recursively)","for changes.")
+        print("When a .nef file is created or modified, it will be automatically converted to FITS.")
+        print("*"*80)
+        while True:
+            observer.join(timeout)
+    except KeyboardInterrupt:
+        print("\n"+"*"*80)
+        print("nef2fits was interrupted manually, stopping the watch! Bye bye.")
+        observer.stop()
+    finally:
+        observer.join()
+        observer.stop()
+    
 
 def main():
-    parser = argparse.ArgumentParser(prog="nef2fits",description="Image converter from NEF to FITS format")
-    
-    parser.add_argument("files",type=str,nargs="+",help=".nef files to process. Multiple files are converted sequentially.")
-    parser.add_argument("-p","--prefix",default="",help="Folder to output the converted files. "
+    # arg parser definition
+    parser = argparse.ArgumentParser()
+    subparsers = parser.add_subparsers(title='Subcommands',description='Valid subcommands',dest="command")
+    # subparsers
+    convert_parser = subparsers.add_parser("convert",help="Input .nef files to convert")
+    watch_parser = subparsers.add_parser("watch",help="Watch directory for new .nef files and convert them automatically")
+    # common arguments
+    convert_parser.add_argument("files",type=str,nargs="+",help=".nef files to process. Multiple files are converted sequentially.")
+    watch_parser.add_argument("directory",type=str,default=".",help="Directory to watch for new .nef files to process. FITS files are not overwritten.")
+    watch_parser.add_argument("-r","--recursive",action="store_true",help="Whether the watching is done recursively or not.")
+
+    for p in [convert_parser,watch_parser]:
+        p.add_argument("-p","--prefix",default="",help="Folder to output the converted files. "
                         "If `--prefix='baz'`, `./foo/00.nef` would be converted to `./baz/foo/00.fits`.")
-    #parser.add_argument("-o","--overwrite",action="store_true",help="whether to overwrite files (the default) or not.")
-    parser.add_argument("--header",type=str,help="JSON File with extra elements to be appenden to the FITS header. "
+        p.add_argument("--header",type=str,help="JSON File with extra elements to be appended to the FITS header. "
                         "Must be an array, and each element must be a (key,value) array or (key,value,comment) array.")
-    
-    
+        p.add_argument("-o","--overwrite",action="store_true",default=True,help="whether to overwrite files (the default) or not.")
+
+    # argument handling
     args = parser.parse_args()
-    if args.header is None:
-        header = []
-    elif os.path.exists(args.header):
+    header = []
+
+    if args.header is not None and os.path.exists(args.header):
         with open(args.header) as file:
             header = [*map(tuple,json.load(file))]
     
-    for path in args.files:
-        nef2fits(path,header_constants=header,prefix=args.prefix)
+    # processing 
+    match args.command:
+        case "convert":
+            for path in args.files:
+                if os.path.exists(path):
+                    output_fname = nef2fits(path,header_constants=header,prefix=args.prefix,overwrite=args.overwrite)
+                    print("converted",path,"to fits format, exported to:",output_fname)
+                else:
+                    raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT),path)
+        case "watch":
+            try:
+                watch(args.directory,recursive=args.recursive,header_constants=header,prefix=args.prefix,overwrite=args.overwrite)
+            except Exception as e:
+                print(timestamp(),end=" ")
+                print(f"Exception happened: {e}, but I will not stop watching.")
+            
 
+    #if ""
+    #for path in 
+
+    #parser = argparse.ArgumentParser(prog="nef2fits",description="Image converter from NEF to FITS format")
+    #subparsers = parser.add_subparsers(title="Subcommands",help="")
+    #watch_parser = subparsers.add_parser("watch",help="Watch directory for new .nef files and convert automatically.")
+#
+    #if "watch" not in sys.argv:
+    #    parser.add_argument("files",type=str,nargs="+",help=".nef files to process. Multiple files are converted sequentially.")
+    #watch_parser.add_argument("directory",type=str,help="Directory to watch for new .nef files to process. FITS files are not overwritten.")
+    #watch_parser.add_argument("-r","--recursive",action="store_true",help="Whether the watching is done recursively or not.")
+#
+    #for p in [parser,watch_parser]:
+    #    p.add_argument("-p","--prefix",default="",help="Folder to output the converted files. "
+    #                   "If `--prefix='baz'`, `./foo/00.nef` would be converted to `./baz/foo/00.fits`.")
+    #    p.add_argument("--header",type=str,help="JSON File with extra elements to be appended to the FITS header. "
+    #                   "Must be an array, and each element must be a (key,value) array or (key,value,comment) array.")
+    
+    
+    #watch_parser.add_argument("-p","--prefix",default="",help="Folder to output the converted files. "
+    #                          "If `--prefix='baz'`, `./foo/00.nef` would be converted to `./baz/foo/00.fits`.")
+    #watch_parser.add_argument("--header",type=str,help="JSON File with extra elements to be appended to the FITS header. "
+    #                       "Must be an array, and each element must be a (key,value) array or (key,value,comment) array.")
+    #watch_parser.add_argument("-r","--recursive",action="store_true",help="Whether the watching is done recursively or not.")
+    #
+    #parser.add_argument("-p","--prefix",default="",help="Folder to output the converted files. "
+    #                    "If `--prefix='baz'`, `./foo/00.nef` would be converted to `./baz/foo/00.fits`.")
+    ##parser.add_argument("-o","--overwrite",action="store_true",help="whether to overwrite files (the default) or not.")
+    #parser.add_argument("--header",type=str,help="JSON File with extra elements to be appended to the FITS header. "
+    #                    "Must be an array, and each element must be a (key,value) array or (key,value,comment) array.")
+    
+    
+    #args = parser.parse_args()
+    #print(args)
+    #if args.header is None:
+    #    header = []
+    #elif os.path.exists(args.header):
+    #    with open(args.header) as file:
+    #        header = [*map(tuple,json.load(file))]
+   # 
+    #for path in args.files:
 
 if __name__ == "__main__":
     main()
